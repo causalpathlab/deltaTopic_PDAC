@@ -1,0 +1,326 @@
+---
+title: "Bayesian delta Topic"
+author: "Yichen Zhang"
+output:
+  html_document:
+    self_contained: true
+    keep_md: true
+params:
+  Save_Path: models/BETM_spliced_ep2000_nlv32_bs1024_lr0.01_train_size0.9_pip0rho_0.1_klbeta_10.0v1
+---
+```{r setup, echo=FALSE, message=FALSE}
+source("util.R")
+source("util_analysis.R")
+library(ggplot2)
+library(data.table)
+library(magrittr)
+library(reshape2)
+library(dplyr)
+library(patchwork)
+library(RColorBrewer)
+library(grDevices)
+library(msigdbr)
+library(goseq)
+library(fgsea)
+knitr::opts_chunk$set(results = "asis")
+```
+
+```{r readpath, echo=FALSE}
+Save_Path <- params$Save_Path
+```
+
+## Bayesian deltaTopic: Bayesian Dynamically-Encoded Latent Transcriptomic pattern Analysis by Topic modeling
+## Results
+
+```{r read genes}
+.genes <- fread(paste0(Save_Path, "/genes.csv.gz"), header = TRUE)
+setnames(.genes, "V1", "gene")
+```
+
+Cell type marker genes from Peng et al 2019
+Get the top 50 genes for each cell type based on p-values
+```{r marker genes}
+.db = readxl::read_xls("data/cell_type_markers/cell_markers_Peng2019.xls")
+setnames(.db, "Gene", "gene")
+setnames(.db, "Cell type", "cell type")
+.db <- as.data.table(.db)
+.db <- .db[`p value` <=0, tail(.SD, 50) ,by = `cell type`]
+```
+
+```{r get full weights, echo=FALSE}
+readDT_melt <- function(Save_Path, parameter, target){
+    readpath <- paste0(Save_Path, "/model_parameters/", paste0(parameter, "_", target, ".txt"))
+    a <- fread(readpath, col.names = .genes$gene)
+    a[, Var1 := rownames(a)] %>% reshape2::melt(id.vars = "Var1", value.name = parameter)
+}
+
+# notice that all BETM file are named with rho as it is "shared"
+target <- "rho"
+file <- paste0(Save_Path, "/dt_rho.rds")
+if(!file.exists(file)){
+    param.dt.rho <- readDT_melt(Save_Path, "slab_mean", target) %>%
+        merge(readDT_melt(Save_Path, "slab_lnvar", target), allow.cartesian = TRUE) %>%
+        merge(readDT_melt(Save_Path, "spike_logit", target), allow.cartesian = TRUE) %>%
+        merge(.genes, by.x = "variable", by.y = "gene", allow.cartesian = TRUE) %>%
+        mutate(pip = 1/(1 + exp(-spike_logit))) %>%
+        mutate(row = `Var1`, col = `variable`, weight = slab_mean * pip) %>%
+        mutate(parameter := target)
+    saveRDS(param.dt.rho, file)
+}
+param.dt.rho <- readRDS(file)
+
+```
+
+### Bayesian spike-slab prior enforces model sparsity (Rho)
+```{r hist.dt, fig.width=8, fig.height=6, echo=FALSE}
+
+if(!dir.exists(paste0(Save_Path, "/figures/"))){
+    dir.create(paste0(Save_Path, "/figures"))
+}
+hist.dt <- param.dt.rho[slab_mean > 0, .(.N),
+                    by = .(spike_logit=round(spike_logit*3)/3, topic = paste0("topic ", Var1))]
+plt <-
+    ggplot(hist.dt, aes(spike_logit, log10(`N`))) +
+    facet_wrap(~topic) +
+    theme_classic() +
+    scale_x_continuous("logit (posterior inclusion probability)") +
+    geom_bar(stat = "identity")
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_logit_rho.pdf"), plot=plt,
+        width=8, height=6)
+```
+
+### Rho Topics correspond to known cell types
+```{r fig.width=9, fig.height=5, echo=FALSE}
+cutoff_rho = 5
+plt <- celltype_heatmap(param.dt.rho, .db, cutoff_rho)
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_marker_genes_rho.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+```{r heatmap rho weights all genes, fig.width=9, fig.height=5, echo=FALSE}
+cutoff_rho = 5
+
+.show.param.allgenes.rho <-
+    param.dt.rho %>%
+    mutate(weight = pmin(pmax(weight, -cutoff_rho), cutoff_rho)) %>%
+    order.pair(ret.tab = TRUE) %>%
+    as.data.table
+
+p <-
+    ggplot(.show.param.allgenes.rho, aes(col, row, fill = weight)) +
+    theme(legend.position = "top") +
+    geom_tile() + xlab("genes") + ylab("topics") +
+    scale_fill_distiller("topic-specific\ngene activities", palette = "RdBu", direction=-1) +
+    ggtitle(paste0("Heatmap: ", target, " weights"))
+print(p)
+.ggsave(paste0(Save_Path,"/figures/sparse_heatmap_genes_rho.pdf"), plot=p,
+        width=9, height=5)    
+```
+
+
+
+### GSEA for Topics
+
+Geneset: Immuesig and Hallmark, KEGG from MsigDb
+```{r gse setup, echo=FALSE}
+# Load msigdb genesets
+IMMUNESIG.human.db <- msigdbr::msigdbr(species = "human",
+										category = "C7",
+										subcategory = "IMMUNESIGDB")
+
+IMMUNESIG.lol <- IMMUNESIG.human.db %>% dplyr::select(gene_symbol, gs_name) %>% make.gs.lol()
+
+HALLMARK.human.db <- msigdbr::msigdbr(species = "human",
+										category = "H")
+
+HALLMARK.lol <- HALLMARK.human.db %>% dplyr::select(gene_symbol, gs_name) %>% make.gs.lol()
+
+KEGG.human.db <- msigdbr::msigdbr(species = "human",
+										category = "C2",
+                                        subcategory = "CP")
+
+KEGG.lol <- KEGG.human.db %>% dplyr::select(gene_symbol, gs_name) %>% make.gs.lol()
+
+
+.show.param.full.rho <-
+    param.dt.rho %>%
+    mutate(pip = 1/(1 + exp(-spike_logit))) %>% 
+    mutate(row = `Var1`, col = `variable`, weight = slab_mean * pip) %>%
+    order.pair(ret.tab = TRUE) %>%
+    as.data.table    
+```
+
+#### Rank based GSEA - fgsea
+
+
+##### immunesig_rho
+
+```{r fgsea.alltopic.immunesig_rho, fig.width=9, fig.height=5, echo = FALSE, eval = FALSE}
+file <- paste0(Save_Path, "/gsea/IMMUNESIG_rho.rds")
+if(!file.exists(file)){
+    result_IMMUNESIG_rho <- fgsea_all_topics(.show.param.full.rho, IMMUNESIG.lol)
+    saveRDS(result_IMMUNESIG_rho, file)
+}
+result_IMMUNESIG_rho <- readRDS(file)
+present.fgsea.result.alltopics(result_IMMUNESIG_rho, N_pathways = 1, N_genes = 3) %>% knitr::kable()
+
+.db_IMMUNESIG = get_geneset.dt(result_IMMUNESIG_rho, N_genes = 10, p_cutoff = 0.1)
+plt <- geneset_heatmap(param.dt.rho, .db_IMMUNESIG, cutoff_rho)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_rho_immunesig.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+##### Hallmark_rho
+
+```{r fgsea.alltopic.hallmark_rho, fig.width=9, fig.height=5, echo = FALSE, eval = FALSE}
+file <- paste0(Save_Path, "/gsea/HALLMARK_rho.rds")
+if(!file.exists(file)){
+    result_HALLMARK <- fgsea_all_topics(.show.param.full.rho, HALLMARK.lol)
+    saveRDS(result_HALLMARK, file)
+}
+result_HALLMARK <- readRDS(file)
+present.fgsea.result.alltopics(result_HALLMARK, N_pathways = 1, N_genes = 3) %>% knitr::kable()
+
+.db_HALLMARK = get_geneset.dt(result_HALLMARK, N_genes = 10, p_cutoff = 0.1)
+plt <- geneset_heatmap(param.dt.rho, .db_HALLMARK, cutoff_rho)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_rho_hallmark.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+##### KEGG_rho
+
+```{r fgsea.alltopics.kegg_rho, fig.width=9, fig.height=5, echo = FALSE, eval = FALSE}
+file <- paste0(Save_Path, "/gsea/KEGG_rho.rds")
+if(!file.exists(file)){
+    result_KEGG <- fgsea_all_topics(.show.param.full.rho, KEGG.lol)
+    saveRDS(result_KEGG, file)
+}
+result_KEGG <- readRDS(file)
+
+present.fgsea.result.alltopics(result_KEGG, N_pathways = 1, N_genes = 3) %>% knitr::kable()
+
+.db_KEGG = get_geneset.dt(result_KEGG, N_genes = 10, p_cutoff = 0.1)
+plt <- geneset_heatmap(param.dt.rho, .db_KEGG, cutoff_rho)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_rho_kegg.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+### aggregate all gsea(rho)
+```{r aggregate.gsea_rho, echo=FALSE, eval = FALSE}
+fgsea.results.aggregata <- tibble()
+
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_KEGG, N_pathways = 1, N_genes = 3))
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_HALLMARK, N_pathways = 1, N_genes = 3))
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_IMMUNESIG_rho, N_pathways = 1, N_genes = 3))
+
+fgsea.results.aggregata <- fgsea.results.aggregata %>% as.data.table
+fgsea.results.aggregata[,.SD[which.min(padj)], by = topic] %>% select(topic,pathway,padj, topGenes) %>% knitr::kable()
+```
+
+
+### Cell type topics are nearly disjoint and well-defined
+```{r fig.width=5, fig.height=4}
+topics <- fread(paste0(Save_Path, "/topics.csv"))
+topics <- topics[, -1] 
+
+file <- paste0(Save_Path, "/umap.rds")
+if(!file.exists(file)){
+    .umap <- uwot::umap(topics,
+                    fast_sgd = TRUE,
+                    n_threads = 16,
+                    min_dist = 0,
+                    spread = 5,
+                    metric = "cosine",
+                    n_neighbors = 50)
+    saveRDS(.umap, file)
+}
+.umap <- readRDS(file)
+.dt <- data.table(.umap, k = apply(t(topics), 2, which.max))
+K <- ncol(topics)
+mycolors <- colorRampPalette(brewer.pal(12, "Paired"))(K)
+plt <-
+    ggplot(.dt, aes(V1, V2, fill=factor(k, 1:K))) +
+    xlab("umap1") + ylab("umap2") +
+    geom_point(stroke=0, pch=21, size = 1) +
+    scale_fill_manual(values=mycolors)
+
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_umap.pdf"), plot=plt,
+        width=5, height=4)
+
+# Topics frequency
+knitr::kable(.dt$k %>% table() %>% sort(decreasing=T))
+```
+
+### Structure plot
+```{r fig.width=7, fig.height=3, echo=FALSE}
+topics <- fread(paste0(Save_Path, "/topics.csv"))
+K <- ncol(topics)-1
+colnames(topics) <- c("V1", 1:K)
+
+file <- paste0(Save_Path, "/struct_dt.rds")
+if(!file.exists(file)){
+    .dt <- as.data.table(reshape2::melt(topics, id.vars=1)) %>%
+    mutate(col = V1, row = variable, weight = value) %>%
+    col.order(rev(1:K), ret.tab=TRUE) %>%
+    as.data.table
+    saveRDS(.dt, file)
+}
+.dt <- readRDS(file)
+
+mycolors <- colorRampPalette(brewer.pal(12, "Paired"))(K)
+plt <- 
+    ggplot(.dt, aes(x=`col`, y=`weight`, fill=as.factor(`variable`), color=as.factor(`variable`))) +
+    xlab("cells") + ylab("topic proportion") +
+    theme(legend.position = "bottom") +
+    geom_bar(stat="identity", position="stack", size=0) +
+    scale_fill_manual(values=mycolors) +
+    scale_color_manual(values=mycolors)
+    
+print(plt)
+.ggsave(paste0(Save_Path, "/figures/sparse_structure.pdf"), plot=plt,
+        width=7, height=3)
+```
+
+### check gene-level and topic-level bias
+```{r fig.width=7, fig.height=3, echo=FALSE}
+
+
+bias_gene_rho <- fread(paste0(Save_Path, "/model_parameters/bias_gene_", "rho", ".txt"))
+names(bias_gene_rho) <- .genes$gene
+bias_gene_rho[,param := "rho"]
+
+bias_topic_rho <- fread(paste0(Save_Path, "/model_parameters/bias_topic_", "rho", ".txt"))
+bias_topic_rho[,param := "rho"]
+bias_topic_rho[,topic := paste0("topic", 1:nrow(bias_topic_rho))]
+setnames(bias_topic_rho, "V1", "bias")
+
+bias_gene <- 
+            melt(bias_gene_rho, variable.name = "gene",value.name = "bias", id.vars = "param")
+
+bias_topic <- rbind(bias_topic_delta, bias_topic_rho)
+            
+plt1 <- ggplot(bias_gene, aes(x = as.factor(gene), y = bias, fill = param))+ 
+    geom_bar(stat="identity", position="stack", size=0)+
+    geom_hline(yintercept=0, linetype="dashed", color = "red")+ 
+    xlab("gene") + ylab("bias") 
+
+plt2 <- ggplot(bias_topic, aes(x = as.factor(topic), y = bias, fill = param))+ 
+    geom_bar(stat="identity", position="stack", size=0)+
+    geom_hline(yintercept=0, linetype="dashed", color = "red")+ 
+    xlab("topic") + ylab("bias") 
+
+plt <- plt1/plt2
+
+print(plt)
+.ggsave(paste0(Save_Path, "/figures/bias_check.pdf"), plot=plt,
+        width=7, height=3)
+```

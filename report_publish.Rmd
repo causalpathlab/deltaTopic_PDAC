@@ -1,0 +1,858 @@
+---
+title: "Bayesian delta Topic"
+author: "Yichen Zhang"
+output:
+  html_document:
+    self_contained: true
+    keep_md: true
+params:
+  Save_Path: models/BDeltaTopic_allgenes_ep2000_nlv32_bs1024_combinebyadd_lr0.01_train_size1.0_pip0rho_0.1_pip0delta_0.1_klbeta_10.0v1
+---
+```{r setup, echo=FALSE, message=FALSE}
+source("util.R")
+source("util_analysis.R")
+library(ggplot2)
+library(data.table)
+library(magrittr)
+library(reshape2)
+library(dplyr)
+library(patchwork)
+library(RColorBrewer)
+library(grDevices)
+library(msigdbr)
+library(goseq)
+library(fgsea)
+library(dplyr)
+library(tidyr)
+library(rsvd)
+library(R.utils)
+knitr::opts_chunk$set(results = "asis")
+```
+
+```{r readpath, echo=FALSE}
+Save_Path <- "models/BDeltaTopic_allgenes_ep2000_nlv32_bs1024_combinebyadd_lr0.01_train_size1.0_pip0rho_0.1_pip0delta_0.1_klbeta_10.0v1"
+```
+
+## Bayesian deltaTopic: Bayesian Dynamically-Encoded Latent Transcriptomic pattern Analysis by Topic modelling
+## Results
+
+```{r read genes}
+.genes <- fread(paste0(Save_Path, "/genes.csv"), header = TRUE)
+setnames(.genes, "V1", "gene")
+```
+
+Cell type marker genes from Peng et al 2019
+```{r marker genes}
+.db = readxl::read_xls("data/cell_type_markers/cell_markers_Peng2019.xls")
+setnames(.db, "Gene", "gene")
+setnames(.db, "Cell type", "cell type")
+.db <- as.data.table(.db)
+# Get the top 50 genes for each cell type based on p-values
+#.db <- .db[`p value` <=0, tail(.SD, 50) ,by = `cell type`]
+```
+
+```{r prepare data and markers for mmultiR annot, echo = FALSE}
+datapath <- "/home/BCCRC.CA/yzhang/projects/data/CRA001160/PDAC/pdac_velocity_topic/Results/QC"
+mtx_file <- paste0(datapath, "/final_qc_spliced.mtx.gz")
+# create row_file for mmultiR
+genes <- fread(paste0(datapath, "/final_qc_spliced.genes.gz"))
+fwrite(list(genes$SYMBOL), file = paste0(datapath, "/final_qc_spliced_rows.gz"))
+row_file <- paste0(datapath, "/final_qc_spliced_rows.gz")
+
+markers <- list()
+marker_peng_2019 = readxl::read_xls("data/cell_type_markers/cell_markers_Peng2019.xls")
+
+data_wide <- spread(marker_peng_2019, `Cell type`, Gene)
+cells = marker_peng_2019$`Cell type` %>% unique()
+for(cell in cells){
+print(cell)
+data_wide[[cell]] = ifelse(is.na(data_wide[[cell]]), 0, 1)
+print(sum(data_wide[[cell]]))
+}
+data_wide$Gene = marker_peng_2019$Gene 
+data_wide <- data_wide %>% as.data.table()
+marker_matrix <- data_wide[,.(Ductal_cell_1 = sum(`Ductal cell 1`),
+                            Ductal_cell_2 = sum(`Ductal cell 2`),
+                            Acinar_cell = sum(`Acinar cell`),
+                            Endocrine_cell = sum(`Endocrine cell`),
+                            Endothelial_cell = sum(`Endothelial cell`),
+                            Fibroblast = sum (`Fibroblast`),
+                            Stellate_cell = sum(`Stellate cell`),
+                            Macrophage = sum(`Macrophage`),
+                            T_cell = sum(`T cell`),
+                            B_cell = sum(`B cell`)), by = Gene]
+markers_list = list(Ductal_cell_1 = marker_matrix[Ductal_cell_1>0, Gene],
+                    Ductal_cell_2 = marker_matrix[Ductal_cell_2>0, Gene],
+                    Acinar_cell = marker_matrix[Acinar_cell>0, Gene],
+                    Endocrine_cell = marker_matrix[Endocrine_cell>0, Gene],
+                    Endothelial_cell = marker_matrix[Endothelial_cell>0, Gene],
+                    Fibroblast = marker_matrix[Fibroblast>0, Gene],
+                    Stellate_cell = marker_matrix[Stellate_cell>0, Gene],
+                    Macrophage = marker_matrix[Macrophage>0, Gene],
+                    T_cell = marker_matrix[T_cell>0, Gene],
+                    B_cell = marker_matrix[B_cell>0, Gene])
+
+markers[['annot.peng2019']] <- markers_list
+```
+```{r mmultiR cell annotaion}
+if(!file.exists("mmultiR_annot_pancreas_marker.Rdata")){
+out <- mmutilR::rcpp_mmutil_annotate_columns(
+        row_file = row_file,
+        mtx_file = mtx_file,
+        pos_labels = markers)
+save(out, file = paste0("mmultiR_annot_pancreas_marker.Rdata"))
+}
+```
+
+```{r get full weights, echo=FALSE}
+readDT_melt <- function(Save_Path, parameter, target){
+    readpath <- paste0(Save_Path, "/model_parameters/", paste0(parameter, "_", target, ".txt"))
+    a <- fread(readpath, col.names = .genes$gene)
+    a[, Var1 := rownames(a)] %>% reshape2::melt(id.vars = "Var1", value.name = parameter)
+}
+
+target <- "rho"
+file <- paste0(Save_Path, "/dt_rho.rds")
+if(!file.exists(file)){
+    param.dt.rho <- readDT_melt(Save_Path, "slab_mean", target) %>%
+        merge(readDT_melt(Save_Path, "slab_lnvar", target), allow.cartesian = TRUE) %>%
+        merge(readDT_melt(Save_Path, "spike_logit", target), allow.cartesian = TRUE) %>%
+        merge(.genes, by.x = "variable", by.y = "gene", allow.cartesian = TRUE) %>%
+        mutate(pip = 1/(1 + exp(-spike_logit))) %>%
+        mutate(row = `Var1`, col = `variable`, weight = slab_mean * pip) %>%
+        mutate(parameter := target)
+    saveRDS(param.dt.rho, file)
+}
+param.dt.rho <- readRDS(file)
+
+target <- "delta"
+file <- paste0(Save_Path, "/dt_delta.rds")
+if(!file.exists(file)){
+    param.dt.delta <- readDT_melt(Save_Path, "slab_mean", target) %>%
+        merge(readDT_melt(Save_Path, "slab_lnvar", target), allow.cartesian = TRUE) %>%
+        merge(readDT_melt(Save_Path, "spike_logit", target), allow.cartesian = TRUE) %>%
+        merge(.genes, by.x = "variable", by.y = "gene", allow.cartesian = TRUE) %>%
+        mutate(pip = 1/(1 + exp(-spike_logit))) %>%
+        mutate(row = `Var1`, col = `variable`, weight = slab_mean * pip) %>%
+        mutate(parameter := target)
+
+    saveRDS(param.dt.delta, file)
+}
+param.dt.delta <- readRDS(file)
+```
+
+
+### Bayesian spike-slab prior enforces model sparsity (Rho)
+```{r hist.dt, fig.width=8, fig.height=6, echo=FALSE}
+hist.dt <- param.dt.rho[slab_mean > 0, .(.N),
+                    by = .(spike_logit=round(spike_logit*3)/3, topic = paste0("topic ", Var1))]
+plt <-
+    ggplot(hist.dt, aes(spike_logit, log10(`N`))) +
+    facet_wrap(~topic) +
+    theme_classic() +
+    scale_x_continuous("logit (posterior inclusion probability)") +
+    geom_bar(stat = "identity")
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_logit_rho.pdf"), plot=plt,
+        width=8, height=6)
+```
+
+### Rho Topics correspond to known cell types
+```{r fig.width=9, fig.height=5, echo=FALSE}
+cutoff_rho <- 4 #7 =
+
+#param.dt.rho[,new_weight:=as.vector(scale(weight)),by=row]
+
+#param.dt.rho[,max(weight), by = row]
+
+#param.dt.rho_top <-param.dt.rho %>%                                      # Top N highest values by group
+#  arrange(desc(weight)) %>% 
+#  group_by(row) %>%
+#  slice(1:50)
+
+plt <- celltype_heatmap(param.dt.rho, .db[`p value` <=0, tail(.SD, 70) ,by = `cell type`], cutoff_rho)
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_marker_genes_rho.pdf"), plot=plt,
+        width=9, height=10)
+      
+```
+
+```{r heatmap rho weights all genes, fig.width=9, fig.height=5, echo=FALSE}
+cutoff_rho = 10
+
+.show.param.allgenes.rho <-
+    param.dt.rho %>%
+    mutate(weight = pmin(pmax(weight, -cutoff_rho), cutoff_rho)) %>%
+    order.pair(ret.tab = TRUE) %>%
+    as.data.table
+
+
+topgenes <- param.dt.rho %>%   # Top N highest values by group
+  arrange(desc(weight)) %>% 
+  group_by(row) %>%
+  slice(1:3)
+
+topgenes_match <- aggregate(topgenes$variable, by = list(topgenes$Var1), FUN = paste0, collapse = "/")
+
+
+p <-
+    ggplot(.show.param.allgenes.rho, aes(col, row, fill = weight)) +
+    theme(legend.position = "top") +
+    geom_tile() + xlab("genes") + ylab("topics") +
+    scale_fill_distiller("topic-specific\ngene activities", palette = "RdBu", direction=-1) +
+    #ggtitle(paste0("Heatmap: ", target, " weights")) + 
+    scale_y_discrete(breaks = topgenes_match$Group.1, labels = paste0(topgenes_match$Group.1, ", ", topgenes_match$x))
+    
+print(p)
+.ggsave(paste0(Save_Path,"/figures/sparse_heatmap_genes_rho.pdf"), plot=p,
+        width=9, height=5)
+```
+
+### delta topic sparsity
+```{r fig.width=8, fig.height=6, echo=FALSE}
+hist.dt <- param.dt.delta[slab_mean > 0, .(.N),
+                    by = .(spike_logit=round(spike_logit*3)/3, topic = paste0("topic ", Var1))]
+
+plt <-
+    ggplot(hist.dt, aes(spike_logit, log10(`N`))) +
+    facet_wrap(~topic) +
+    theme_classic() +
+    scale_x_continuous("logit (posterior inclusion probability)") +
+    geom_bar(stat = "identity")
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_logit_delta.pdf"), plot=plt,
+        width=8, height=6)
+```
+
+### delta Topics not correspond to cell type, so to what?
+```{r fig.width=9, fig.height=5, echo = FALSE}
+cutoff_delta <- 5
+plt <- celltype_heatmap(param.dt.delta, .db, cutoff_delta)
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_marker_genes_delta.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+```{r heatmap delta weights allgenes, fig.width=9, fig.height=5, echo=FALSE}
+cutoff_delta <- 4
+.show.param.allgenes.delta <-
+    param.dt.delta %>%
+    mutate(weight = pmin(pmax(weight, -cutoff_delta), cutoff_delta)) %>%
+    order.pair(ret.tab = TRUE) %>%
+    as.data.table
+
+topgenes <- param.dt.delta %>%   # Top N highest values by group
+  arrange(desc(weight)) %>%
+  group_by(row) %>%
+  slice(1:3)
+
+topgenes_match <- aggregate(topgenes$variable, by = list(topgenes$Var1), FUN = paste0, collapse = "/")
+
+p <-
+    ggplot(.show.param.allgenes.delta, aes(col, row, fill = weight)) +
+    theme(legend.position = "top") +
+    geom_tile() + xlab("genes") + ylab("topics") +
+    scale_y_discrete(breaks = topgenes_match$Group.1, labels = paste0(topgenes_match$Group.1, ", ", topgenes_match$x)) +
+    scale_fill_distiller("topic-specific\ngene activities", palette = "RdBu", direction=-1)
+    #ggtitle(paste0("Heatmap: delta weights"))
+
+print(p)
+
+.ggsave(paste0(Save_Path,"/figures/sparse_heatmap_genes_delta.pdf"), plot=p,
+        width=9, height=5)
+```
+
+### 2D - vector fields
+```{r 2D vector filds, fig.width=9, fig.height=5, echo=FALSE}
+set.seed(666) # for rsvd reproducibility
+
+# convert weight.dt to matrix
+## rho weight
+
+dcast(param.dt.rho, row  ~ col, value.var = "weight") -> weight.mat.rho
+weight.mat.rho %>% data.matrix() -> weight.mat.rho
+rownames(weight.mat.rho) <- weight.mat.rho[,1]
+weight.mat.rho <- weight.mat.rho[, 2:ncol(weight.mat.rho)]
+
+#write.csv(weight.mat.rho, file=paste0(Save_Path, "/rho_weight.csv"))
+#gzip(paste0(Save_Path, "/rho_weight.csv"), paste0(Save_Path, "/rho_weight.csv.gz"))
+
+## delta weight
+dcast(param.dt.delta, row  ~ col, value.var = "weight") -> weight.mat.delta
+weight.mat.delta %>% data.matrix() -> weight.mat.delta
+rownames(weight.mat.delta) <- weight.mat.delta[,1]
+weight.mat.delta <- weight.mat.delta[, 2:ncol(weight.mat.delta)]
+
+#write.csv(weight.mat.delta, file=paste0(Save_Path, "/delta_weight.csv"))
+#gzip(paste0(Save_Path, "/delta_weight.csv"), paste0(Save_Path, "/delta_weight.csv.gz"))
+
+## ETM weight
+Save_Path_ETM <- "models/BETM_spliced_ep2000_nlv32_bs1024_lr0.01_train_size0.9_pip0rho_0.1_klbeta_10.0v1" 
+dt.ETM<- readRDS(paste0(Save_Path_ETM, "/dt_rho.rds"))
+
+dcast(dt.ETM, row  ~ col, value.var = "weight") -> weight.mat.ETM
+weight.mat.ETM %>% data.matrix() -> weight.mat.ETM
+rownames(weight.mat.ETM) <- weight.mat.ETM[,1]
+weight.mat.ETM <- weight.mat.ETM[, 2:ncol(weight.mat.ETM)]
+
+#write.csv(weight.mat.ETM, file=paste0(Save_Path_ETM, "/ETM_weight.csv"))
+#gzip(paste0(Save_Path_ETM, "/ETM_weight.csv"), paste0(Save_Path_ETM, "/ETM_weight.csv.gz"))
+
+
+#1. svd on rho = U * D * V^T with rank 2
+rsvd(t(weight.mat.rho), k = 2) -> svd.rho
+#2. project rho + delta onto the same space
+# W = (rho + delta)^T U D^{-1}
+W <- (weight.mat.rho + weight.mat.delta) %*% svd.rho$u %*% diag(1/svd.rho$d)
+#3. Draw edges from $V$ to $W$ to show topic "vector fields" in 2D space
+df_to_plot <- data.frame(
+    V1 = svd.rho$v[,1],
+    V2 = svd.rho$v[,2],
+    W1 = W[,1],
+    W2 = W[,2],
+    topic = rownames(weight.mat.rho)
+)
+library(ggrepel)
+#TODO: remove small topics
+#TODO: color by significant(red), non-significant(grey)
+p_topic <- ggplot(df_to_plot, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2),
+                    arrow = arrow(length = unit(0.1, "cm")),
+                    size = 0.25) + # Make the line segments 0.25 mm thick
+        geom_text_repel(aes(label = topic), size = 3) +
+        ggtitle("Topic vector fields")
+
+#4. Draw edges after multiplying each cell's topic proportion matrix $\theta$ (cell $\times$ topic)
+topics <- fread(paste0(Save_Path, "/topics.csv"))
+# Note: topic.csv is python 0-based index but weight matrix is 1-based index
+paste0("topic_", as.numeric(row.names(weight.mat.rho))-1) -> topic_order
+cell_order <- topics$V1
+topics[,..topic_order] %>% data.matrix() -> theta
+rownames(theta) <- cell_order
+
+cell_v <- theta %*% svd.rho$v
+cell_w <- theta %*% W
+# load cell type annotation results
+load("mmultiR_annot_pancreas_marker.Rdata")
+
+
+df_to_plot_cell <- data.frame(
+    V1 = cell_v[, 1],
+    V2 = cell_v[, 2],
+    W1 = cell_w[, 1],
+    W2 = cell_w[, 2],
+    cell = rownames(theta),
+    cell_type = out$annotation$argmax, 
+    B_cell = ifelse(out$annotation$argmax == "B_cell", "Yes", "Others"),
+    T_cell = ifelse(out$annotation$argmax == "T_cell", "Yes", "Others"),
+    Macrophage = ifelse(out$annotation$argmax == "Macrophage", "Yes", "Others"),
+    Stellate_cell = ifelse(out$annotation$argmax == "Stellate_cell", "Yes", "Others"),
+    Ductal_cell_2 = ifelse(out$annotation$argmax == "Ductal_cell_2", "Yes", "Others"),
+    Fibroblast = ifelse(out$annotation$argmax == "Fibroblast", "Yes", "Others"),
+    Acinar_cell = ifelse(out$annotation$argmax == "Acinar_cell", "Yes", "Others"),
+    Endocrine_cell = ifelse(out$annotation$argmax == "Endocrine_cell", "Yes", "Others"),
+    Endothelial_cell = ifelse(out$annotation$argmax == "Endothelial_cell", "Yes", "Others"),
+    Ductal_cell_1 = ifelse(out$annotation$argmax == "Ductal_cell_1", "Yes", "Others"),
+    topic = apply(t(topics[,-c("V1")]), 2, which.max)
+)
+
+df_to_plot_cell$topic_surv <- df_to_plot_cell$topic
+df_to_plot_cell$topic_surv[!df_to_plot_cell$topic_surv %in% c("4", "11",
+                                                        "26","6")] <- "Others"
+
+set.seed(668)
+p_surv <- ggplot(df_to_plot_cell %>% sample_frac(0.03), aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = topic_surv),
+                    arrow = arrow(length = unit(0.03, "cm")),
+                    size = 0.2) + 
+        scale_color_manual(name = c("Survial Topics"), 
+                          values = c("11" = "red", "4" = "red",
+                                     "26" = "blue", "6" = "blue",
+                                     "Others" = "grey"))
+
+p_surv
+
+.ggsave(paste0(Save_Path,"/figures/2D_vector_field_cell_surv.pdf"), plot=p_surv,
+        width=18, height=9)
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(B_cell) %>% sample_n(1000)
+p_B_cell <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = B_cell),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_B_cell
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(T_cell) %>% sample_n(1000)
+p_T_cell <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = T_cell),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_T_cell
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Macrophage) %>% sample_n(1000)
+p_Macrophage <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Macrophage),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Macrophage
+
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Stellate_cell) %>% sample_n(1000)
+p_Stellate_cell <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Stellate_cell),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) + 
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Stellate_cell
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Fibroblast) %>% sample_n(1000)
+p_Fibroblast <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Fibroblast),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Fibroblast
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Acinar_cell) %>% sample_n(1000)
+p_Acinar_cell <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Acinar_cell),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Acinar_cell
+
+
+## only has 23 too few to plot
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Endothelial_cell) %>% sample_n(23)
+p_Endothelial_cell <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Endothelial_cell),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Endothelial_cell
+
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Ductal_cell_1) %>% sample_n(96)
+p_Ductal_cell_1 <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Ductal_cell_1),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) +
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Ductal_cell_1
+
+
+df_to_plot_cell_final <- df_to_plot_cell %>% group_by(Ductal_cell_2) %>% sample_n(1000)
+p_Ductal_cell_2 <- ggplot(df_to_plot_cell_final, aes(x = V1, y = V2)) +
+        geom_segment(aes(xend = W1, yend = W2, color = Ductal_cell_2),
+                    arrow = arrow(length = unit(0.05, "cm")),
+                    size = 0.1) + 
+        scale_color_manual(values = c("Others" = "grey", "Yes" = "red"))
+#p_Ductal_cell_2
+
+
+p_cell <- (p_T_cell/p_Stellate_cell/p_B_cell/p_Acinar_cell)|(p_Macrophage/p_Ductal_cell_2/p_Fibroblast/p_Ductal_cell_1/p_Endothelial_cell)
+
+p_topic
+p_cell
+
+.ggsave(paste0(Save_Path,"/figures/2D_vector_field_topic.pdf"), plot=p_topic,
+        width=18, height=9)
+.ggsave(paste0(Save_Path,"/figures/2D_vector_field_cell.pdf"), plot=p_cell,
+        width=18, height=9)
+```
+
+
+### GSEA for delta Topics
+
+Geneset: Immuesig and Hallmark, KEGG from MsigDb
+```{r gse setup, echo=FALSE}
+# Load msigdb genesets
+IMMUNESIG.human.db <- msigdbr::msigdbr(species = "human",
+										category = "C7",
+										subcategory = "IMMUNESIGDB")
+
+IMMUNESIG.lol <- IMMUNESIG.human.db %>% select(gene_symbol, gs_name) %>% make.gs.lol()
+
+HALLMARK.human.db <- msigdbr::msigdbr(species = "human",
+										category = "H")
+
+HALLMARK.lol <- HALLMARK.human.db %>% select(gene_symbol, gs_name) %>% make.gs.lol()
+
+KEGG.human.db <- msigdbr::msigdbr(species = "human",
+										category = "C2",
+                                        subcategory = "CP")
+
+KEGG.lol <- KEGG.human.db %>% select(gene_symbol, gs_name) %>% make.gs.lol()
+
+.show.param.full.delta <-
+    param.dt.delta %>%
+    mutate(pip = 1/(1 + exp(-spike_logit))) %>% 
+    mutate(row = `Var1`, col = `variable`, weight = slab_mean * pip) %>%
+    order.pair(ret.tab = TRUE) %>%
+    as.data.table
+
+.show.param.full.rho <-
+    param.dt.rho %>%
+    mutate(pip = 1/(1 + exp(-spike_logit))) %>% 
+    mutate(row = `Var1`, col = `variable`, weight = slab_mean * pip) %>%
+    order.pair(ret.tab = TRUE) %>%
+    as.data.table
+```
+
+#### Rank based GSEA - fgsea
+
+##### immunesig_delta
+
+```{r fgsea.alltopic.immunesig_delta, fig.width=9, fig.height=5, echo = FALSE}
+file <- paste0(Save_Path, "/gsea/IMMUNESIG_delta.rds")
+if(!file.exists(file)){
+    result_IMMUNESIG_delta <- fgsea_all_topics(.show.param.full.delta, IMMUNESIG.lol)
+    saveRDS(result_IMMUNESIG_delta, file)
+}
+result_IMMUNESIG_delta <- readRDS(file)
+present.fgsea.result.alltopics(result_IMMUNESIG_delta, N_pathways = 1, N_genes = 3) -> fgsea_result
+fgsea_result %>% knitr::kable()
+# topics with significant enrichment with cutoff at 0.1
+p_cutoff <- 0.1
+topics_with_sig_enrichment <- fgsea_result$topic[fgsea_result$padj < p_cutoff]
+# only showing the significant pathways
+.db_IMMUNESIG = get_geneset.dt(result_IMMUNESIG_delta, N_genes = 10, p_cutoff = p_cutoff)
+
+# omit the GSE in pathway names in the plotting
+.db_IMMUNESIG_to_plot <- .db_IMMUNESIG
+.db_IMMUNESIG_to_plot$pathway <- gsub("^.*?_","",.db_IMMUNESIG_to_plot$pathway)
+plt <- geneset_heatmap(param.dt.delta[row %in% topics_with_sig_enrichment], .db_IMMUNESIG_to_plot, weight_cutoff = 3)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_delta_immunesig.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+##### Hallmark_delta
+
+```{r fgsea.alltopic.hallmark_delta, fig.width=9, fig.height=5, echo = FALSE}
+file <- paste0(Save_Path, "/gsea/HALLMARK_delta.rds")
+if(!file.exists(file)){
+    result_HALLMARK <- fgsea_all_topics(.show.param.full.delta, HALLMARK.lol)
+    saveRDS(result_HALLMARK, file)
+}
+result_HALLMARK <- readRDS(file)
+present.fgsea.result.alltopics(result_HALLMARK, N_pathways = 1, N_genes = 3) -> fgsea_result
+fgsea_result %>% knitr::kable()
+
+# topics with significant enrichment with cutoff at 0.1
+p_cutoff <- 0.05
+topics_with_sig_enrichment <- fgsea_result$topic[fgsea_result$padj < p_cutoff]
+# only showing the significant pathways
+
+.db_HALLMARK = get_geneset.dt(result_HALLMARK, N_genes = 10, p_cutoff = p_cutoff)
+
+# omit the GSE in pathway names in the plotting
+.db_HALLMARK_to_plot <- .db_HALLMARK
+.db_HALLMARK_to_plot$pathway <- gsub("^.*?_","",.db_HALLMARK_to_plot$pathway)
+
+plt <- geneset_heatmap(param.dt.delta[row %in% topics_with_sig_enrichment], .db_HALLMARK_to_plot, 3)
+print(plt)
+
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_delta_hallmark.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+##### KEGG_delta
+
+```{r fgsea.alltopics.kegg_delta, fig.width=9, fig.height=5, echo = FALSE}
+file <- paste0(Save_Path, "/gsea/KEGG_delta.rds")
+if(!file.exists(file)){
+    result_KEGG <- fgsea_all_topics(.show.param.full.delta, KEGG.lol)
+    saveRDS(result_KEGG, file)
+}
+result_KEGG <- readRDS(file)
+
+present.fgsea.result.alltopics(result_KEGG, N_pathways = 1, N_genes = 3) -> fgsea_result
+fgsea_result %>% knitr::kable()
+
+# topics with significant enrichment with cutoff at 0.1
+p_cutoff <- 0.1
+topics_with_sig_enrichment <- fgsea_result$topic[fgsea_result$padj < p_cutoff]
+# only showing the significant pathways
+
+.db_KEGG = get_geneset.dt(result_KEGG, N_genes = 10, p_cutoff = p_cutoff)
+
+# omit the GSE in pathway names in the plotting
+.db_KEGG_to_plot <- .db_KEGG
+
+plt <- geneset_heatmap(param.dt.delta[row %in% topics_with_sig_enrichment], .db_KEGG_to_plot, 2.5)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_delta_kegg.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+### aggregate all gsea(delta)
+```{r aggregate.gsea_delta, echo=FALSE}
+fgsea.results.aggregata <- tibble()
+
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_KEGG, N_pathways = 1, N_genes = 3))
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_HALLMARK, N_pathways = 1, N_genes = 3))
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_IMMUNESIG_delta, N_pathways = 1, N_genes = 3))
+
+fgsea.results.aggregata <- fgsea.results.aggregata %>% as.data.table
+fgsea.results.aggregata[,.SD[which.min(padj)], by = topic] %>% select(topic,pathway,padj, topGenes) %>% knitr::kable()
+```
+
+##### immunesig_rho
+
+```{r fgsea.alltopic.immunesig_rho, fig.width=9, fig.height=5, echo = FALSE}
+file <- paste0(Save_Path, "/gsea/IMMUNESIG_rho.rds")
+if(!file.exists(file)){
+    result_IMMUNESIG_rho <- fgsea_all_topics(.show.param.full.rho, IMMUNESIG.lol)
+    saveRDS(result_IMMUNESIG_rho, file)
+}
+result_IMMUNESIG_rho <- readRDS(file)
+present.fgsea.result.alltopics(result_IMMUNESIG_rho, N_pathways = 1, N_genes = 3) %>% knitr::kable()
+
+.db_IMMUNESIG = get_geneset.dt(result_IMMUNESIG_rho, N_genes = 10, p_cutoff = 0.1)
+plt <- geneset_heatmap(param.dt.rho, .db_IMMUNESIG, cutoff_rho)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_rho_immunesig.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+##### Hallmark_rho
+
+```{r fgsea.alltopic.hallmark_rho, fig.width=9, fig.height=5, echo = FALSE}
+file <- paste0(Save_Path, "/gsea/HALLMARK_rho.rds")
+if(!file.exists(file)){
+    result_HALLMARK <- fgsea_all_topics(.show.param.full.rho, HALLMARK.lol)
+    saveRDS(result_HALLMARK, file)
+}
+result_HALLMARK <- readRDS(file)
+present.fgsea.result.alltopics(result_HALLMARK, N_pathways = 1, N_genes = 3) %>% knitr::kable()
+
+.db_HALLMARK = get_geneset.dt(result_HALLMARK, N_genes = 10, p_cutoff = 0.1)
+plt <- geneset_heatmap(param.dt.rho, .db_HALLMARK, cutoff_rho)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_rho_hallmark.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+##### KEGG_rho
+
+```{r fgsea.alltopics.kegg_rho, fig.width=9, fig.height=5, echo = FALSE}
+file <- paste0(Save_Path, "/gsea/KEGG_rho.rds")
+if(!file.exists(file)){
+    result_KEGG <- fgsea_all_topics(.show.param.full.rho, KEGG.lol)
+    saveRDS(result_KEGG, file)
+}
+result_KEGG <- readRDS(file)
+
+present.fgsea.result.alltopics(result_KEGG, N_pathways = 1, N_genes = 3) %>% knitr::kable()
+
+.db_KEGG = get_geneset.dt(result_KEGG, N_genes = 10, p_cutoff = 0.1)
+plt <- geneset_heatmap(param.dt.rho, .db_KEGG, cutoff_rho)
+print(plt)
+
+.ggsave(paste0(Save_Path,"/figures/heatmap_rho_kegg.pdf"), plot=plt,
+        width=9, height=5)
+```
+
+### aggregate all gsea(rho)
+```{r aggregate.gsea_rho, echo=FALSE}
+fgsea.results.aggregata <- tibble()
+
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_KEGG, N_pathways = 1, N_genes = 3))
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_HALLMARK, N_pathways = 1, N_genes = 3))
+fgsea.results.aggregata <- bind_rows(fgsea.results.aggregata,present.fgsea.result.alltopics(result_IMMUNESIG_rho, N_pathways = 1, N_genes = 3))
+
+fgsea.results.aggregata <- fgsea.results.aggregata %>% as.data.table
+fgsea.results.aggregata[,.[which.min(padj)], by = topic] %>% select(topic,pathway,padj, topGenes) %>% knitr::kable()
+```
+
+
+### Cell type topics are nearly disjoint and well-defined
+```{r fig.width=5, fig.height=4}
+topics <- fread(paste0(Save_Path, "/topics.csv")) # python 0-based indexing
+cell_id <- topics$V1
+samples <- fread(paste0(Save_Path, "/samples.csv"))
+# check if sample id matches
+all(samples$V1 == cell_id)
+
+topics <- topics[, -1]
+
+file <- paste0(Save_Path, "/umap.rds")
+if(!file.exists(file)){
+    .umap <- uwot::umap(topics,
+                    fast_sgd = TRUE,
+                    n_threads = 16,
+                    min_dist = 0,
+                    spread = 5,
+                    metric = "cosine",
+                    n_neighbors = 50)
+    saveRDS(.umap, file)
+}
+.umap <- readRDS(file)
+.dt <- data.table(.umap, k = apply(t(topics), 2, which.max))
+#.dt <- merge(.dt, samples, by= "V1")
+K <- ncol(topics)
+mycolors <- colorRampPalette(brewer.pal(12, "Paired"))(K)
+plt <-
+    ggplot(.dt, aes(V1, V2, fill=factor(k, 1:K))) +
+    xlab("umap1") + ylab("umap2") +
+    geom_point(stroke=0, pch=21, size = 1) +
+    scale_fill_manual(values=mycolors)
+
+print(plt)
+.ggsave(paste0(Save_Path,"/figures/sparse_umap.pdf"), plot=plt,
+        width=5, height=4)
+
+# Topics frequency
+knitr::kable(.dt$k %>% table() %>% sort(decreasing=T))
+```
+
+```{r fretable bar plot}
+
+freq_table <- data.table(.dt$k %>% table())
+colnames(freq_table)  <- c("topic", "freq")
+# manually fill in for the empty topics
+empty_topics <- data.table(topic = c("13","16", "20","29"), freq = c(1,1,1,1))
+freq_table <- rbind(freq_table, empty_topics)
+
+# rho cell types
+topic_order <- as.character(c(8,10,15,18,25,28,20,21,24,16,13,31,29,5,23,12,32,4,11,2,7,3,22,19,17,14,9,27,30,1,26,6))
+
+p <- ggplot(freq_table, aes(y = log10(freq), x = topic)) +
+        geom_bar(stat="identity") +
+        theme_bw()+
+        xlab("Topic") + ylab("Frequency (Log10)") +
+        scale_x_discrete(limits = rev(topic_order)) +
+        coord_flip()
+p
+.ggsave(paste0(Save_Path,"/figures/topic_freq_rho_cell.pdf"), plot=p,
+        width=5, height=9)
+
+# gsea immunesig db
+
+topic_order <- as.character(c(23,17,20,28,8,2,4,30,24))
+
+p <- ggplot(freq_table, aes(y = log10(freq), x = topic)) +
+        geom_bar(stat="identity") +
+        xlab("Topic") + ylab("Frequency (Log10)") +
+        theme_bw() +
+        scale_x_discrete(limits = rev(topic_order)) +
+        coord_flip()
+p
+.ggsave(paste0(Save_Path,"/figures/topic_freq_delta_immune.pdf"), plot=p,
+        width=5, height=5)
+
+
+# gsea KEGG db
+
+topic_order <- as.character(c(29,31,9,17,4,18))
+
+p <- ggplot(freq_table, aes(y = log10(freq), x = topic)) +
+        geom_bar(stat="identity") +
+        xlab("Topic") + ylab("Frequency (Log10)") +
+        theme_bw() +
+        scale_x_discrete(limits = rev(topic_order)) +
+        coord_flip()
+p
+.ggsave(paste0(Save_Path,"/figures/topic_freq_delta_KEGG.pdf"), plot=p,
+        width=5, height=5)
+
+# gsea HALLMARK db
+
+topic_order <- as.character(c(3,17,19,5,14,26,6,18,15,24,16,12,8,28))
+
+p <- ggplot(freq_table, aes(y = log10(freq), x = topic)) +
+        geom_bar(stat="identity") +
+        xlab("Topic") + ylab("Frequency (Log10)") +
+        theme_bw() +
+        scale_x_discrete(limits = rev(topic_order)) +
+        coord_flip()
+p
+.ggsave(paste0(Save_Path,"/figures/topic_freq_delta_HALLMARK.pdf"), plot=p,
+        width=5, height=5)
+
+```
+### Structure plot
+
+```{r fig.width=7, fig.height=3, echo=FALSE}
+topics <- fread(paste0(Save_Path, "/topics.csv"))
+K <- ncol(topics)-1
+colnames(topics) <- c("V1", 1:K)
+
+file <- paste0(Save_Path, "/struct_dt.rds")
+if(!file.exists(file)){
+    .dt <- as.data.table(reshape2::melt(topics, id.vars=1)) %>%
+    mutate(col = V1, row = variable, weight = value) %>%
+    col.order(rev(1:K), ret.tab=TRUE) %>%
+    as.data.table
+    saveRDS(.dt, file)
+}
+.dt <- readRDS(file)
+
+mycolors <- colorRampPalette(brewer.pal(12, "Paired"))(K)
+library(ggrastr)
+plt <- 
+    ggplot(.dt, aes(x=`col`, y=`weight`, fill=as.factor(`variable`), color=as.factor(`variable`))) +
+    xlab("cells") + ylab("topic proportion") +
+    theme(legend.position = "bottom") +
+    rasterise(geom_bar(stat="identity", position="stack", size=0), dpi=300) +
+    scale_fill_manual(values=mycolors) +
+    scale_color_manual(values=mycolors)
+    
+print(plt)
+.ggsave(paste0(Save_Path, "/figures/sparse_structure.pdf"), plot=plt,
+        width=7, height=3)
+
+```
+
+
+
+### check gene-level and topic-level bias
+```{r fig.width=7, fig.height=3, echo=FALSE}
+bias_gene_delta <- fread(paste0(Save_Path, "/model_parameters/bias_gene_", "delta", ".txt"))
+names(bias_gene_delta) <- .genes$gene
+bias_gene_delta[,param := "delta"]
+
+bias_gene_rho <- fread(paste0(Save_Path, "/model_parameters/bias_gene_", "rho", ".txt"))
+names(bias_gene_rho) <- .genes$gene
+bias_gene_rho[,param := "rho"]
+
+bias_topic_delta <- fread(paste0(Save_Path, "/model_parameters/bias_topic_", "delta", ".txt"))
+bias_topic_delta[,param := "delta"]
+bias_topic_delta[,topic := paste0("topic", 1:nrow(bias_topic_delta))]
+setnames(bias_topic_delta, "V1", "bias")
+
+bias_topic_rho <- fread(paste0(Save_Path, "/model_parameters/bias_topic_", "rho", ".txt"))
+bias_topic_rho[,param := "rho"]
+bias_topic_rho[,topic := paste0("topic", 1:nrow(bias_topic_rho))]
+setnames(bias_topic_rho, "V1", "bias")
+
+bias_gene <- melt(bias_gene_delta, variable.name = "gene",value.name = "bias", id.vars = "param") %>%
+            rbind(melt(bias_gene_rho, variable.name = "gene",value.name = "bias", id.vars = "param"))
+
+bias_topic <- rbind(bias_topic_delta, bias_topic_rho)
+            
+plt1 <- ggplot(bias_gene, aes(x = as.factor(gene), y = bias, fill = param))+ 
+    geom_bar(stat="identity", position="stack", size=0)+
+    geom_hline(yintercept=0, linetype="dashed", color = "red")+ 
+    xlab("gene") + ylab("bias") 
+
+plt2 <- ggplot(bias_topic, aes(x = as.factor(topic), y = bias, fill = param))+ 
+    geom_bar(stat="identity", position="stack", size=0)+
+    geom_hline(yintercept=0, linetype="dashed", color = "red")+
+    xlab("topic") + ylab("bias") 
+
+plt <- plt1/plt2
+
+print(plt)
+.ggsave(paste0(Save_Path, "/figures/bias_check.pdf"), plot=plt,
+        width=7, height=3)
+```
